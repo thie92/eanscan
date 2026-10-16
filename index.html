@@ -139,8 +139,9 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
 .actions .btn { flex: 1 1 140px; }
 .viewer { position: relative; width: 100%; aspect-ratio: 4 / 3; max-height: 52vh; background: #000; border-radius: 10px; overflow: hidden; }
 .viewer video { width: 100%; height: 100%; object-fit: cover; display: block; }
-.aim { position: absolute; inset: 22% 8%; border: 2px solid rgba(255, 255, 255, 0.75); border-radius: 10px; display: grid; place-items: center; transition: border-color 0.15s; }
+.aim { position: absolute; inset: 25% 8%; border: 2px solid rgba(255, 255, 255, 0.75); border-radius: 10px; display: grid; place-items: center; transition: border-color 0.15s; }
 .aim i { display: block; width: 100%; height: 2px; background: #FF3B2A; box-shadow: 0 0 8px #FF3B2A; }
+.viewer.seen .aim { border-color: #FBBF24; }
 .viewer.hit .aim { border-color: #4ADE80; }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 </style>
@@ -165,7 +166,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   <section class="panel" id="scan" aria-label="Scansione">
     <div class="viewer" id="viewer" hidden>
       <video id="video" playsinline muted autoplay></video>
-      <div class="aim" aria-hidden="true"><i></i></div>
+      <div class="aim" id="aim" aria-hidden="true"><i></i></div>
     </div>
     <button id="liveBtn" class="btn primary big" type="button">Avvia scansione</button>
     <div class="pair">
@@ -221,6 +222,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   </section>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/barcode-detector@3.2.1/dist/iife/ponyfill.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script>
 (function () {
@@ -248,6 +250,12 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   }
   function shouldCount(seen, code, now, gap) {
     return !(Object.prototype.hasOwnProperty.call(seen, code) && now - seen[code] < gap);
+  }
+  function confirmRead(pending, code, now, need, win) {
+    var p = pending[code];
+    if (!p || now - p.t > win) p = pending[code] = { n: 0, t: now };
+    p.n++; p.t = now;
+    return p.n >= need;
   }
   /* pure:end */
 
@@ -449,8 +457,8 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   async function decodeFile(file) {
     var src = await toBitmap(file);
     try {
-      var native = await nativeDecode(src);
-      if (native && native.length) return native.filter(function (c, i) { return native.indexOf(c) === i; });
+      var found = await photoDetect(src);
+      if (found && found.length) return found;
       var z = await zxingDecode(src);
       return z ? [z] : [];
     } finally { if (src && src.close) src.close(); }
@@ -565,9 +573,106 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     });
   });
 
-  /* Scansione continua con la fotocamera */
-  els.video = $('video'); els.viewer = $('viewer'); els.liveBtn = $('liveBtn');
-  var live = { running: false, stream: null, timer: null, detector: null, errs: 0, reader: null, hints: null, cv: null, ctx: null, audio: null, seen: {} };
+  /* Lettore e scansione continua con la fotocamera */
+  els.video = $('video'); els.viewer = $('viewer'); els.aim = $('aim'); els.liveBtn = $('liveBtn');
+  var FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'];
+  var NEED_READS = 2, READ_WINDOW = 700, RECOUNT_GAP = 1200;
+  var live = { running: false, stream: null, timer: null, tick: 0, errs: 0, bad: false, engine: '', reader: null, hints: null, cv: null, ctx: null, audio: null, seen: {}, pending: {}, lastHit: 0, lastHint: 0 };
+  var detectorPromise = null;
+
+  function getDetector() {
+    if (!detectorPromise) {
+      detectorPromise = (async function () {
+        var Native = window.BarcodeDetector;
+        if (Native) {
+          try {
+            var sup = await Native.getSupportedFormats();
+            var fm = FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; });
+            if (fm.length) { live.engine = 'nativo'; return new Native({ formats: fm }); }
+          } catch (e) {}
+        }
+        var API = window.BarcodeDetectionAPI;
+        if (API && API.BarcodeDetector) {
+          try { var d = new API.BarcodeDetector({ formats: FORMATS }); live.engine = 'ZXing-C++'; return d; } catch (e) {}
+        }
+        live.engine = 'ZXing-JS';
+        return null;
+      })();
+    }
+    return detectorPromise;
+  }
+  function zxingCanvas(cv) {
+    if (typeof ZXing === 'undefined') throw new Error('no-lib');
+    if (!live.reader) {
+      var F = ZXing.BarcodeFormat;
+      live.reader = new ZXing.MultiFormatReader();
+      live.hints = new Map();
+      live.hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      live.hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF]);
+    }
+    try {
+      var bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(cv)));
+      return [live.reader.decode(bmp, live.hints).getText()];
+    } catch (e) { return null; }
+  }
+  async function detectCanvas(cv) {
+    var d = await getDetector();
+    if (d && !live.bad) {
+      try {
+        var r = await d.detect(cv);
+        live.errs = 0;
+        var out = r.map(function (x) { return x.rawValue; }).filter(Boolean);
+        return out.length ? out : null;
+      } catch (e) {
+        live.errs++;
+        if (live.errs >= 3) { live.bad = true; live.engine = 'ZXing-JS'; }
+        return null;
+      }
+    }
+    return zxingCanvas(cv);
+  }
+  async function photoDetect(src) {
+    var d = await getDetector();
+    if (!d || live.bad) return null;
+    var dim = size(src), sc = Math.min(1, 2200 / Math.max(dim.w, dim.h));
+    var cw = Math.round(dim.w * sc), ch = Math.round(dim.h * sc);
+    var cv = document.createElement('canvas'), ctx = cv.getContext('2d', { willReadFrequently: true });
+    for (var rot = 0; rot < 2; rot++) {
+      if (rot === 0) { cv.width = cw; cv.height = ch; ctx.drawImage(src, 0, 0, cw, ch); }
+      else { cv.width = ch; cv.height = cw; ctx.save(); ctx.translate(ch, 0); ctx.rotate(Math.PI / 2); ctx.drawImage(src, 0, 0, cw, ch); ctx.restore(); }
+      try {
+        var r = await d.detect(cv);
+        var out = r.map(function (x) { return x.rawValue; }).filter(Boolean);
+        if (out.length) return out.filter(function (c, i) { return out.indexOf(c) === i; });
+      } catch (e) { return null; }
+    }
+    return [];
+  }
+
+  /* Il riquadro che vedi e' la zona letta, alla risoluzione piena della fotocamera */
+  function cropRect() {
+    var v = els.video, vw = v.videoWidth, vh = v.videoHeight;
+    var vr = els.viewer.getBoundingClientRect(), ar = els.aim.getBoundingClientRect();
+    if (!vw || !vh || !vr.width || !vr.height) return null;
+    var sc = Math.max(vr.width / vw, vr.height / vh);
+    var ox = (vr.width - vw * sc) / 2, oy = (vr.height - vh * sc) / 2;
+    var x = Math.max(0, Math.round(((ar.left - vr.left) - ox) / sc));
+    var y = Math.max(0, Math.round(((ar.top - vr.top) - oy) / sc));
+    var w = Math.min(vw - x, Math.round(ar.width / sc));
+    var h = Math.min(vh - y, Math.round(ar.height / sc));
+    return (w > 40 && h > 40) ? { x: x, y: y, w: w, h: h } : null;
+  }
+  function grab(full) {
+    var v = els.video, vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return null;
+    var r = full ? { x: 0, y: 0, w: vw, h: vh } : cropRect();
+    if (!r) return null;
+    var s = Math.min(1, (full ? 1280 : 1600) / r.w);
+    if (!live.cv) { live.cv = document.createElement('canvas'); live.ctx = live.cv.getContext('2d', { willReadFrequently: true }); }
+    live.cv.width = Math.max(1, Math.round(r.w * s)); live.cv.height = Math.max(1, Math.round(r.h * s));
+    live.ctx.drawImage(v, r.x, r.y, r.w, r.h, 0, 0, live.cv.width, live.cv.height);
+    return live.cv;
+  }
 
   function beep() {
     try {
@@ -578,69 +683,51 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
       o.start(); o.stop(a.currentTime + 0.09);
     } catch (e) {}
   }
-  function hit() {
-    els.viewer.classList.add('hit');
-    setTimeout(function () { els.viewer.classList.remove('hit'); }, 350);
+  function flashClass(cls, ms) {
+    els.viewer.classList.add(cls);
+    setTimeout(function () { els.viewer.classList.remove(cls); }, ms);
   }
-  function zxingFrame() {
-    if (typeof ZXing === 'undefined') throw new Error('no-lib');
-    var v = els.video, w = v.videoWidth, h = v.videoHeight;
-    if (!w || !h) return null;
-    if (!live.reader) {
-      var F = ZXing.BarcodeFormat;
-      live.reader = new ZXing.MultiFormatReader();
-      live.hints = new Map();
-      live.hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-      live.hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF]);
-      live.cv = document.createElement('canvas');
-      live.ctx = live.cv.getContext('2d', { willReadFrequently: true });
-    }
-    var s = Math.min(1, 1100 / Math.max(w, h));
-    live.cv.width = Math.round(w * s); live.cv.height = Math.round(h * s);
-    live.ctx.drawImage(v, 0, 0, live.cv.width, live.cv.height);
-    try {
-      var bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(live.cv)));
-      return [live.reader.decode(bmp, live.hints).getText()];
-    } catch (e) { return null; }
-  }
-  async function detectFrame() {
-    if (live.detector === null) live.detector = ('BarcodeDetector' in window) ? new BarcodeDetector() : false;
-    if (live.detector) {
-      try {
-        var r = await live.detector.detect(els.video);
-        live.errs = 0;
-        return r.map(function (x) { return x.rawValue; }).filter(Boolean);
-      } catch (e) {
-        live.errs++;
-        if (live.errs >= 5) live.detector = false;
-        return null;
-      }
-    }
-    return zxingFrame();
-  }
+
+  /* Un codice conta solo dopo NEED_READS letture uguali ravvicinate: le letture sbagliate non si ripetono uguali */
   function onLiveCodes(codes) {
-    var now = Date.now(), last = null;
+    var now = Date.now(), last = null, unconfirmed = false;
     codes.forEach(function (raw) {
       var code = normalize(raw);
       if (!validCode(code)) return;
-      var count = shouldCount(live.seen, code, now, 1200);
+      if (!confirmRead(live.pending, code, now, NEED_READS, READ_WINDOW)) { unconfirmed = true; return; }
+      var count = shouldCount(live.seen, code, now, RECOUNT_GAP);
       live.seen[code] = now;
       if (!count) return;
       var it = bump(code, 1);
       last = { code: code, qty: it.qty };
     });
-    Object.keys(live.seen).forEach(function (k) { if (now - live.seen[k] > 10000) delete live.seen[k]; });
+    [live.seen, live.pending].forEach(function (m) {
+      Object.keys(m).forEach(function (k) {
+        var at = typeof m[k] === 'number' ? m[k] : m[k].t;
+        if (now - at > 10000) delete m[k];
+      });
+    });
+    if (unconfirmed && !last) flashClass('seen', 250);
     if (!last) return;
-    afterChange(last.code); beep(); hit();
+    live.lastHit = now;
+    afterChange(last.code); beep(); flashClass('hit', 350);
     var warn = checkDigit(last.code) === false;
     say('Letto ' + last.code + ' · quantità ' + last.qty + (warn ? '. La cifra di controllo non torna.' : ''), warn ? 'warn' : 'ok');
   }
+
   async function loop() {
     if (!live.running) return;
     var t0 = performance.now();
     try {
-      var codes = await detectFrame();
+      live.tick++;
+      var cv = grab(live.tick % 4 === 0);
+      var codes = cv ? await detectCanvas(cv) : null;
       if (codes && codes.length) onLiveCodes(codes);
+      var now = Date.now();
+      if (now - Math.max(live.lastHit, live.lastHint) > 8000) {
+        live.lastHint = now;
+        say('Nessuna lettura. Prova a 15–20 cm, con più luce e l’etichetta ferma e dritta nel riquadro.', 'info');
+      }
     } catch (e) {
       if (e && e.message === 'no-lib') {
         stopLive();
@@ -648,7 +735,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
         return;
       }
     }
-    if (live.running) live.timer = setTimeout(loop, Math.max(30, 120 - (performance.now() - t0)));
+    if (live.running) live.timer = setTimeout(loop, Math.max(30, 100 - (performance.now() - t0)));
   }
   async function startLive() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -671,10 +758,12 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     els.video.srcObject = live.stream;
     try { await els.video.play(); } catch (e) {}
     try { await live.stream.getVideoTracks()[0].applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (e) {}
-    live.seen = {}; live.running = true;
+    await getDetector();
+    live.seen = {}; live.pending = {}; live.tick = 0; live.lastHint = 0; live.lastHit = Date.now();
+    live.running = true;
     els.viewer.hidden = false;
     els.liveBtn.textContent = 'Ferma scansione'; els.liveBtn.classList.remove('primary');
-    say('Inquadra un codice alla volta. Per contare un altro pezzo, allontana l’etichetta e riavvicinala.', 'info');
+    say('Lettore ' + live.engine + '. Metti il codice nel riquadro, a 15–20 cm, fermo e ben illuminato.', 'info');
     loop();
   }
   function stopLive() {
@@ -690,6 +779,14 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden && live.running) { stopLive(); say('Scansione ferma. Premi Avvia per riprendere.', 'info'); }
   });
+
+  /* Carica il motore subito, cosi' la prima lettura non aspetta */
+  getDetector().then(function (d) {
+    if (!d) return;
+    var c = document.createElement('canvas'); c.width = 64; c.height = 64;
+    var x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, 64, 64);
+    return d.detect(c);
+  }).catch(function () {});
 
   load();
   els.f1.value = settings.f1; els.f2.value = settings.f2; els.eol.value = settings.eol;
