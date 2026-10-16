@@ -1,7 +1,7 @@
 /* Barcode in TXT: uso senza rete.
    Pagina e icone: prima la rete, poi la copia salvata. Librerie e font da CDN: prima la copia salvata.
    Per forzare l'aggiornamento della copia salvata basta cambiare VERSION. */
-const VERSION = 'v4';
+const VERSION = 'v5';
 const CORE = 'core-' + VERSION;
 const RUNTIME = 'runtime-' + VERSION;
 const CORE_FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];

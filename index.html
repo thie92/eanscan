@@ -173,6 +173,8 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
 .cap { margin: 0; font-size: 13.5px; color: var(--muted); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .actions .btn { flex: 1 1 140px; }
+.actions .wa { flex-basis: 100%; }
+.btn.wa::after { content: "\2192"; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -220,7 +222,9 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
       <div class="field"><label for="eol">A capo del file</label>
         <select id="eol"><option value="crlf">Windows (CRLF)</option><option value="lf">Standard (LF)</option></select>
       </div>
+      <div class="field"><label for="wa">Numero WhatsApp</label><input id="wa" type="text" class="mono" inputmode="tel" maxlength="20" autocomplete="off" placeholder="39333…"></div>
       <p class="hint">Il primo campo occupa fino alla colonna 21, il secondo fino alla 36. Poi vengono il codice, uno spazio e la quantità.</p>
+      <p class="hint">Il numero WhatsApp (con prefisso, senza +) serve solo se il file non si può allegare: in quel caso apro la chat con quel numero.</p>
     </div>
   </details>
 
@@ -247,6 +251,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     <div class="actions">
       <button id="save" class="btn primary" type="button" disabled>Salva .txt</button>
       <button id="copy" class="btn" type="button" disabled>Copia testo</button>
+      <button id="waSend" class="btn wa" type="button" disabled>Invia su WhatsApp</button>
     </div>
     <p id="saveNote" class="cap" hidden>Il salvataggio diretto non è disponibile in questa vista. Usa Copia testo e incolla in un file.</p>
   </section>
@@ -261,7 +266,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   var KEY = 'barcode-in-txt:v1';
   var W1 = 21, W2 = 15;
   var SAMPLE = [['4046402065823', 25], ['4046402084404', 5], ['4046402084770', 2], ['4053865806610', 2]];
-  var settings = { f1: 'IT46', f2: '20', eol: 'crlf' };
+  var settings = { f1: 'IT46', f2: '20', eol: 'crlf', wa: '' };
   var items = [];
 
   /* pure:start */
@@ -312,6 +317,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
         if (typeof d.settings.f1 === 'string') settings.f1 = d.settings.f1.slice(0, 20);
         if (typeof d.settings.f2 === 'string') settings.f2 = d.settings.f2.slice(0, 14);
         if (d.settings.eol === 'lf' || d.settings.eol === 'crlf') settings.eol = d.settings.eol;
+        if (typeof d.settings.wa === 'string') settings.wa = d.settings.wa.slice(0, 20);
       }
     } catch (e) { /* senza memoria locale la pagina funziona lo stesso */ }
   }
@@ -392,7 +398,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     els.cap.textContent = sample
       ? 'Esempio del formato. Le righe vere compaiono appena scansioni un codice.'
       : items.length + (items.length === 1 ? ' riga' : ' righe') + ' · a capo ' + (settings.eol === 'lf' ? 'LF' : 'CRLF');
-    els.save.disabled = sample; els.copy.disabled = sample;
+    els.save.disabled = sample; els.copy.disabled = sample; els.waSend.disabled = sample;
     els.clear.hidden = sample; els.empty.hidden = !sample;
     els.sumF.textContent = settings.f1 + ' · ' + settings.f2;
   }
@@ -847,8 +853,40 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
   }
 
+  /* Invio su WhatsApp: menu di condivisione con il file gia' allegato */
+  els.waSend = $('waSend'); els.wa = $('wa');
+  function waNumber() { return String(settings.wa || '').replace(/\D/g, '').replace(/^00/, ''); }
+  els.wa.addEventListener('input', function () {
+    settings.wa = els.wa.value.replace(/[^\d+\s]/g, '');
+    persist();
+  });
+  els.waSend.addEventListener('click', async function () {
+    if (!items.length) return;
+    var name = fileName(), text = buildText();
+    var file = new File([text], name, { type: 'text/plain' });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: name });
+        say('Condivisione chiusa. Controlla in WhatsApp che il messaggio sia partito.', 'ok');
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') { say('Invio annullato.', 'info'); return; }
+    }
+    /* Ripiego: scarico il file e apro la chat, da cui lo allegherai con la graffetta */
+    try {
+      var url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+      var a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    } catch (e) {}
+    window.open('https://wa.me/' + waNumber() + '?text=' + encodeURIComponent('Inventario ' + name), '_blank', 'noopener');
+    say('File scaricato. In WhatsApp allega ' + name + ' con la graffetta.', 'info');
+  });
+
   load();
-  els.f1.value = settings.f1; els.f2.value = settings.f2; els.eol.value = settings.eol;
+  els.f1.value = settings.f1; els.f2.value = settings.f2; els.eol.value = settings.eol; els.wa.value = settings.wa;
   renderList(); renderDerived();
   say('Pronto. Premi Avvia scansione e inquadra i codici uno dopo l’altro.', 'info');
 })();
