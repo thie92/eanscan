@@ -145,6 +145,18 @@ input[type="text"], select {
 #scan.scanning .pair, #scan.scanning .manual { display: none; }
 .row { scroll-margin-top: var(--stick-h, 0px); }
 
+/* Modo di lettura: continua oppure a pulsante */
+.mode { display: grid; grid-template-columns: 1fr 1fr; border: 1.5px solid var(--ink); border-radius: 2px; }
+.mode label { display: flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 10px; font: 700 12.5px var(--font-display); font-stretch: 108%; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.mode input:checked + label { background: var(--ink); color: var(--bg); }
+#scan.scanning .mode, #scan.scanning #trigHint { display: none; }
+.btn, .viewer { touch-action: manipulation; }
+.viewer.armed .aim { border-color: var(--signal); border-width: 3px; }
+.viewer.armed .aim i { height: 3px; }
+#scan.scanning.trig-mode { grid-template-areas: "view view" "stat stat" "trig btn"; }
+#scan.scanning.trig-mode #trigBtn { grid-area: trig; min-height: 56px; }
+#scan.scanning.trig-mode #liveBtn { min-height: 56px; }
+
 .status { margin: 0; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; min-height: 1.5em; font-size: 15px; }
 .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; transform: translateY(-1px); }
 .status[data-tone="ok"]::before { background: var(--ok); }
@@ -212,7 +224,13 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
       <video id="video" playsinline muted autoplay></video>
       <div class="aim" id="aim" aria-hidden="true"><i></i></div>
     </div>
+    <div class="mode" role="radiogroup" aria-label="Modo di lettura">
+      <input type="radio" name="mode" id="modeCont" value="cont" class="vh"><label for="modeCont">Continua</label>
+      <input type="radio" name="mode" id="modeTrig" value="trigger" class="vh"><label for="modeTrig">A pulsante</label>
+    </div>
+    <p class="cap" id="trigHint" hidden>Legge solo quando premi Leggi, tocchi l&rsquo;inquadratura o premi un tasto di un telecomando o tastiera Bluetooth (spazio, invio, frecce, pagina su/giù).</p>
     <button id="liveBtn" class="btn primary big" type="button">Avvia scansione</button>
+    <button id="trigBtn" class="btn primary big" type="button" hidden>Leggi</button>
     <div class="pair">
       <input id="cam" class="vh" type="file" accept="image/*" capture="environment">
       <label class="btn" for="cam">Scatta una foto</label>
@@ -278,7 +296,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   var KEY = 'barcode-in-txt:v1';
   var W1 = 21, W2 = 15;
   var SAMPLE = [['4046402065823', 25], ['4046402084404', 5], ['4046402084770', 2], ['4053865806610', 2]];
-  var settings = { f1: 'IT46', f2: '20', eol: 'crlf', wa: '' };
+  var settings = { f1: 'IT46', f2: '20', eol: 'crlf', wa: '', mode: 'cont' };
   var items = [];
 
   /* pure:start */
@@ -330,6 +348,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
         if (typeof d.settings.f2 === 'string') settings.f2 = d.settings.f2.slice(0, 14);
         if (d.settings.eol === 'lf' || d.settings.eol === 'crlf') settings.eol = d.settings.eol;
         if (typeof d.settings.wa === 'string') settings.wa = d.settings.wa.slice(0, 20);
+        if (d.settings.mode === 'cont' || d.settings.mode === 'trigger') settings.mode = d.settings.mode;
       }
     } catch (e) { /* senza memoria locale la pagina funziona lo stesso */ }
   }
@@ -744,7 +763,8 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
       var code = normalize(raw);
       if (!validCode(code)) return;
       if (!confirmRead(live.pending, code, now, NEED_READS, READ_WINDOW)) { unconfirmed = true; return; }
-      var count = shouldCount(live.seen, code, now, RECOUNT_GAP);
+      if (triggerMode() && last) return;
+      var count = triggerMode() ? true : shouldCount(live.seen, code, now, RECOUNT_GAP);
       live.seen[code] = now;
       if (!count) return;
       var it = bump(code, 1);
@@ -758,6 +778,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     });
     if (unconfirmed && !last) flashClass('seen', 250);
     if (!last) return;
+    if (triggerMode()) disarm();
     live.lastHit = now;
     afterChange(last.code); beep(); flashClass('hit', 350);
     var warn = checkDigit(last.code) === false;
@@ -768,12 +789,18 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     if (!live.running) return;
     var t0 = performance.now();
     try {
-      live.tick++;
-      var cv = grab(live.tick % 4 === 0);
-      var codes = cv ? await detectCanvas(cv) : null;
-      if (codes && codes.length) onLiveCodes(codes);
+      if (triggerMode() && live.armUntil && Date.now() > live.armUntil) {
+        disarm();
+        say('Nessun codice letto. Inquadra meglio e premi di nuovo.', 'warn');
+      }
+      if (!triggerMode() || live.armUntil) {
+        live.tick++;
+        var cv = grab(live.tick % 4 === 0);
+        var codes = cv ? await detectCanvas(cv) : null;
+        if (codes && codes.length) onLiveCodes(codes);
+      }
       var now = Date.now();
-      if (now - Math.max(live.lastHit, live.lastHint) > 8000) {
+      if (!triggerMode() && now - Math.max(live.lastHit, live.lastHint) > 8000) {
         live.lastHint = now;
         say('Nessuna lettura. Prova a 15–20 cm, con più luce e l’etichetta ferma e dritta nel riquadro.', 'info');
       }
@@ -811,9 +838,9 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     live.seen = {}; live.pending = {}; live.tick = 0; live.lastHint = 0; live.lastHit = Date.now();
     live.running = true;
     els.viewer.hidden = false;
-    els.scan.classList.add('scanning'); updateStick();
+    els.scan.classList.add('scanning'); updateTrigUI();
     els.liveBtn.textContent = 'Ferma scansione'; els.liveBtn.classList.remove('primary');
-    say('Lettore ' + live.engine + '. Metti il codice nel riquadro, a 15–20 cm, fermo e ben illuminato.', 'info');
+    say('Lettore ' + live.engine + (triggerMode() ? '. Inquadra il codice e premi Leggi, tocca l’inquadratura o un tasto del telecomando.' : '. Metti il codice nel riquadro, a 15–20 cm, fermo e ben illuminato.'), 'info');
     loop();
   }
   function stopLive() {
@@ -821,7 +848,7 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
     if (live.stream) live.stream.getTracks().forEach(function (t) { t.stop(); });
     live.stream = null; els.video.srcObject = null;
     els.viewer.hidden = true;
-    els.scan.classList.remove('scanning'); updateStick();
+    els.scan.classList.remove('scanning'); disarm(); updateTrigUI();
     els.liveBtn.textContent = 'Avvia scansione'; els.liveBtn.classList.add('primary');
   }
   els.liveBtn.addEventListener('click', function () {
@@ -908,8 +935,52 @@ details.settings summary .mono { font-size: 14px; color: var(--ink); }
   window.addEventListener('resize', updateStick);
   window.addEventListener('orientationchange', updateStick);
 
+  /* Lettura a pulsante: legge solo quando premi Leggi, tocchi l'inquadratura o un tasto Bluetooth */
+  els.trigBtn = $('trigBtn'); els.trigHint = $('trigHint'); els.modeCont = $('modeCont'); els.modeTrig = $('modeTrig');
+  var ARM_MS = 1800;
+  var TRIGGER_KEYS = [' ', 'Spacebar', 'Enter', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown',
+    'AudioVolumeUp', 'AudioVolumeDown', 'MediaPlayPause', 'MediaTrackNext', 'MediaTrackPrevious'];
+  function triggerMode() { return settings.mode === 'trigger'; }
+  function syncModeUI() {
+    els.modeCont.checked = !triggerMode(); els.modeTrig.checked = triggerMode();
+    els.trigHint.hidden = !triggerMode();
+  }
+  function updateTrigUI() {
+    var on = live.running && triggerMode();
+    els.trigBtn.hidden = !on;
+    els.scan.classList.toggle('trig-mode', on);
+    updateStick();
+  }
+  function arm() {
+    if (!live.running || !triggerMode()) return;
+    live.pending = {};
+    live.armUntil = Date.now() + ARM_MS;
+    els.viewer.classList.add('armed');
+    say('Lettura…', 'info');
+  }
+  function disarm() {
+    live.armUntil = 0;
+    els.viewer.classList.remove('armed');
+  }
+  [els.modeCont, els.modeTrig].forEach(function (r) {
+    r.addEventListener('change', function () {
+      if (!r.checked) return;
+      settings.mode = r.value; persist(); syncModeUI();
+    });
+  });
+  els.trigBtn.addEventListener('click', arm);
+  els.viewer.addEventListener('click', arm);
+  document.addEventListener('keydown', function (e) {
+    if (!live.running || !triggerMode()) return;
+    var t = e.target, tag = t && t.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (TRIGGER_KEYS.indexOf(e.key) < 0) return;
+    e.preventDefault();
+    if (!e.repeat) arm();
+  });
+
   load();
-  els.f1.value = settings.f1; els.f2.value = settings.f2; els.eol.value = settings.eol; els.wa.value = settings.wa;
+  els.f1.value = settings.f1; els.f2.value = settings.f2; els.eol.value = settings.eol; els.wa.value = settings.wa; syncModeUI();
   renderList(); renderDerived();
   say('Pronto. Premi Avvia scansione e inquadra i codici uno dopo l’altro.', 'info');
 })();
